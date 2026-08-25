@@ -189,6 +189,7 @@ class TencentVideoUploadRequest:
     debug: bool = True
     headless: bool = True
     collection_name: str | None = None
+    declare_original: bool = False
 
 
 @dataclass(slots=True)
@@ -593,13 +594,6 @@ async def upload_bilibili_video(request: BilibiliVideoUploadRequest) -> Path:
 
 async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
     account_file = resolve_account_file("tencent", request.account_name)
-    is_ready = await tencent_setup(str(account_file), handle=False)
-    if not is_ready:
-        raise RuntimeError(
-            f"Tencent/WeChat Channels cookie is missing or expired: {account_file}. "
-            f"Run `sau tencent login --account {request.account_name}` first."
-        )
-
     app = TencentVideo(
         title=request.title,
         file_path=str(request.video_file),
@@ -607,6 +601,7 @@ async def upload_tencent_video(request: TencentVideoUploadRequest) -> Path:
         publish_date=request.publish_date,
         account_file=str(account_file),
         category=request.category,
+        declare_original=request.declare_original,
         is_draft=request.is_draft,
         desc=request.description,
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
@@ -931,6 +926,11 @@ def build_parser() -> argparse.ArgumentParser:
     tencent_upload_video_parser.add_argument("--thumbnail-portrait", type=existing_file_path, help="Optional 3:4 portrait thumbnail path")
     tencent_upload_video_parser.add_argument("--short-title", help="Optional WeChat Channels short title")
     tencent_upload_video_parser.add_argument("--category", help="Optional original content category")
+    tencent_upload_video_parser.add_argument(
+        "--declare-original",
+        action="store_true",
+        help="Check the WeChat Channels original-content declaration",
+    )
     tencent_upload_video_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing")
     tencent_upload_video_parser.add_argument("--collection", default=None, help="Optional collection name to add the work into (must already exist)")
     add_runtime_flags(tencent_upload_video_parser)
@@ -1272,6 +1272,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 thumbnail_portrait_file=args.thumbnail_portrait,
                 short_title=args.short_title,
                 category=args.category,
+                declare_original=args.declare_original,
                 is_draft=args.draft,
                 publish_strategy=publish_strategy,
                 debug=args.debug,

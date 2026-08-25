@@ -130,6 +130,27 @@ class BrowserCliParserTests(unittest.TestCase):
         self.assertEqual(args.thumbnail_landscape, landscape_path)
         self.assertEqual(args.thumbnail_portrait, portrait_path)
 
+    def test_tencent_upload_video_accepts_original_declaration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+            parser = sau_cli.build_parser()
+            args = parser.parse_args(
+                [
+                    "tencent",
+                    "upload-video",
+                    "--account",
+                    "creator",
+                    "--file",
+                    str(video_path),
+                    "--title",
+                    "标题",
+                    "--declare-original",
+                ]
+            )
+
+        self.assertTrue(args.declare_original)
+
     def test_kuaishou_upload_note_accepts_title_and_note(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             image_path = Path(tmp_dir) / "1.png"
@@ -213,11 +234,12 @@ class BrowserCliDispatchTests(unittest.TestCase):
         )
 
         with (
-            patch("sau_cli.tencent_setup", new=AsyncMock(return_value=True)),
+            patch("sau_cli.tencent_setup", new=AsyncMock(return_value=True)) as mock_setup,
             patch.object(sau_cli.TencentVideo, "tencent_upload_video", new=AsyncMock()) as mock_upload,
         ):
             asyncio.run(sau_cli.upload_tencent_video(request))
 
+        mock_setup.assert_not_awaited()
         mock_upload.assert_awaited_once()
 
     def test_dispatch_xiaohongshu_check_prints_valid(self):
@@ -234,8 +256,10 @@ class BrowserCliDispatchTests(unittest.TestCase):
             images=[Path("1.png")],
             title="图文标题",
             note="图文正文",
+            notef=None,
             tags="测试,图文",
             schedule=0,
+            bgm=None,
             debug=False,
             headless=True,
         )
@@ -262,6 +286,7 @@ class BrowserCliDispatchTests(unittest.TestCase):
             product_link="",
             product_title="",
             declaration="已确认声明原文",
+            collection=None,
             debug=False,
             headless=True,
         )
@@ -288,7 +313,9 @@ class BrowserCliDispatchTests(unittest.TestCase):
             thumbnail_portrait=Path("portrait.png"),
             short_title=None,
             category=None,
+            declare_original=True,
             draft=False,
+            collection=None,
             debug=False,
             headless=True,
         )
@@ -298,6 +325,7 @@ class BrowserCliDispatchTests(unittest.TestCase):
         request = mock_upload.await_args.args[0]
         self.assertEqual(request.thumbnail_landscape_file, Path("landscape.png"))
         self.assertEqual(request.thumbnail_portrait_file, Path("portrait.png"))
+        self.assertTrue(request.declare_original)
 
     def test_dispatch_xiaohongshu_upload_video_uses_headed_request(self):
         args = Namespace(

@@ -807,6 +807,27 @@ class TencentBaseUploader(BaseVideoUploader):
         except Exception as exc:
             tencent_logger.warning(_msg("😵", f"设置视频标注「{label_text}」失败，跳过继续发布：{exc}"))
 
+    async def apply_original_declaration(self, page: Page) -> None:
+        if not getattr(self, "declare_original", False):
+            return
+
+        try:
+            checkbox = page.get_by_role("checkbox", name="声明原创", exact=True).first
+            if not await checkbox.count():
+                label = page.locator("label").filter(has_text="声明原创").first
+                if await label.count():
+                    checkbox = label.locator('input[type="checkbox"]').first
+            if not await checkbox.count():
+                raise RuntimeError("发布页面未找到“声明原创”复选框")
+            if not await checkbox.is_checked():
+                await checkbox.check(force=True)
+                await page.wait_for_timeout(300)
+            if not await checkbox.is_checked():
+                raise RuntimeError("“声明原创”复选框未保持勾选状态")
+            tencent_logger.success(_msg("✅", "已勾选声明原创"))
+        except Exception as exc:
+            raise RuntimeError(f"勾选视频号声明原创失败：{exc}") from exc
+
     async def wait_for_upload_complete(
         self, page: Page, timeout_seconds: int = 3600, max_retries: int = 3
     ) -> None:
@@ -956,6 +977,7 @@ class TencentVideo(TencentBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         collection_name: str | None = None,
+        declare_original: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -969,6 +991,7 @@ class TencentVideo(TencentBaseUploader):
         self.file_path = file_path
         self.tags = tags or []
         self.category = category
+        self.declare_original = declare_original
         self.is_draft = is_draft
         self.desc = desc or ""
         self.thumbnail_path = thumbnail_path
@@ -1122,6 +1145,7 @@ class TencentVideo(TencentBaseUploader):
             # 上传完成、表单稳定后再选合集（否则上传中选的会被重置）
             await self.apply_collection(page)
             await self.apply_original_statement(page)
+            await self.apply_original_declaration(page)
             await self.set_thumbnail(page)
 
             if self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
