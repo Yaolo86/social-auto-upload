@@ -23,6 +23,43 @@ from utils.log import douyin_logger
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+FOREGROUND_WINDOW_CLOSED_MARKER = "SAU_FOREGROUND_WINDOW_CLOSED"
+
+
+class ForegroundWindowClosedError(RuntimeError):
+    """The operator closed the visible uploader window and cancelled this run."""
+
+
+def raise_if_foreground_window_closed(page: Page, *, headless: bool) -> None:
+    if not headless and page.is_closed():
+        raise ForegroundWindowClosedError(FOREGROUND_WINDOW_CLOSED_MARKER)
+
+
+def raise_if_foreground_window_closed_error(error: Exception, *, headless: bool) -> None:
+    if headless:
+        return
+    message = str(error).lower()
+    closed_signals = (
+        "target page, context or browser has been closed",
+        "page has been closed",
+        "browser has been closed",
+        "context has been closed",
+    )
+    if any(signal in message for signal in closed_signals):
+        raise ForegroundWindowClosedError(FOREGROUND_WINDOW_CLOSED_MARKER) from error
+
+
+def _launch_browser(playwright, *, headless: bool, args: list[str] | None = None):
+    executable_path = os.environ.get("SAU_BROWSER_EXECUTABLE", "").strip() or LOCAL_CHROME_PATH
+    launch_kwargs = {
+        "headless": headless,
+        "args": args or [],
+    }
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
+    else:
+        launch_kwargs["channel"] = "chromium"
+    return playwright.chromium.launch(**launch_kwargs)
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -114,10 +151,13 @@ async def cookie_auth(account_file):
         return False
 
     use_headless = os.environ.get("DOUYIN_COOKIE_AUTH_HEADLESS", "true").lower() in ("1", "true", "yes")
-    launch_kwargs = {"headless": use_headless, "channel": "chromium", "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"]}
     for _attempt in range(3):
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(**launch_kwargs)
+            browser = await _launch_browser(
+                playwright,
+                headless=use_headless,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
             try:
                 context = await browser.new_context(storage_state=account_file)
                 context = await set_init_script(context)
@@ -276,7 +316,7 @@ async def douyin_cookie_gen(
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             should_close_context = False
         else:
-            browser = await playwright.chromium.launch(headless=headless, channel="chromium")
+            browser = await _launch_browser(playwright, headless=headless)
             context = await browser.new_context()
             should_close_context = True
         context = await set_init_script(context)
@@ -638,10 +678,10 @@ class DouYinVideo(DouYinBaseUploader):
         productTitle="",
         thumbnail_portrait_path=None,
         desc: str | None = None,
-        collection_name: str | None = None,
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        collection_name: str | None = None,
         declaration: str | None = None,
     ):
         super().__init__(
@@ -973,7 +1013,11 @@ class DouYinVideo(DouYinBaseUploader):
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium", args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        browser = await _launch_browser(
+            playwright,
+            headless=self.headless,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
             permissions=["geolocation"],
@@ -1018,6 +1062,7 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.info(_msg("🥳", "已经进入 version_2 发布页面"))
                     break
                 except Exception:
+                    raise_if_foreground_window_closed(page, headless=self.headless)
                     douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
                     await asyncio.sleep(0.5)
 
@@ -1038,6 +1083,7 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.error(_msg("😵", "检测到上传失败，小人准备重试"))
                     await self.handle_upload_error(page)
             except Exception:
+                raise_if_foreground_window_closed(page, headless=self.headless)
                 douyin_logger.debug(_msg("🧍", "小人还在等视频上传完成"))
                 await asyncio.sleep(2)
 
@@ -1050,7 +1096,18 @@ class DouYinVideo(DouYinBaseUploader):
         # 按平台合规如实选「内容由AI生成」（与转载等并列，单选，无二级选项、无需填来源）。
         if not self.declaration:
             self.declaration = "内容由AI生成"
-        await self.apply_self_declaration(page)
+        try:
+            await self.apply_self_declaration(page)
+        except Exception:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            raise
 
         # 先归集：此时尚未打开封面弹窗，避免 dy-creator-content-portal 封面浮层拦截合集下拉
         # （实测：封面弹窗在 headless 下常滞留"检测中"未关闭，会盖住"添加合集"下拉）
@@ -1103,6 +1160,7 @@ class DouYinVideo(DouYinBaseUploader):
                 douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
             except Exception:
+                raise_if_foreground_window_closed(page, headless=self.headless)
                 await self.handle_auto_video_cover(page)
                 douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
                 if self.debug:
@@ -1117,7 +1175,11 @@ class DouYinVideo(DouYinBaseUploader):
 
     async def douyin_upload_video(self):
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            try:
+                await self.upload(playwright)
+            except Exception as exc:
+                raise_if_foreground_window_closed_error(exc, headless=self.headless)
+                raise
 
     async def main(self):
         await self.douyin_upload_video()
@@ -1232,7 +1294,11 @@ class DouYinNote(DouYinBaseUploader):
         await self.validate_upload_args()
         douyin_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium", args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        browser = await _launch_browser(
+            playwright,
+            headless=self.headless,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
             permissions=["geolocation"],

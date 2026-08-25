@@ -32,6 +32,16 @@ BAIJIAHAO_SUCCESS_URL_PREFIX = "https://baijiahao.baidu.com/builder/rc/clue"
 
 # 百度 passport 二维码图片选择器
 QR_SELECTOR = 'img[src^="https://passport.baidu.com/v2/api/qrcode"]'
+FOREGROUND_WINDOW_CLOSED_MARKER = "SAU_FOREGROUND_WINDOW_CLOSED"
+HUMAN_VERIFICATION_REQUIRED_MARKER = "SAU_REQUIRES_HUMAN"
+
+
+class ForegroundWindowClosedError(RuntimeError):
+    """用户关闭前台上传窗口。"""
+
+
+class HumanVerificationRequiredError(RuntimeError):
+    """平台要求用户在可见浏览器中完成人工验证。"""
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -59,9 +69,88 @@ async def _emit_qrcode_callback(qrcode_callback, payload: dict):
 
 def _build_launch_kwargs(headless: bool) -> dict:
     launch_kwargs = {"headless": headless}
-    if LOCAL_CHROME_PATH:
-        launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
+    executable_path = os.environ.get("SAU_BROWSER_EXECUTABLE", "").strip() or LOCAL_CHROME_PATH
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
     return launch_kwargs
+
+
+def _raise_if_foreground_window_closed(page: Page, *, headless: bool) -> None:
+    if not headless and page.is_closed():
+        raise ForegroundWindowClosedError(FOREGROUND_WINDOW_CLOSED_MARKER)
+
+
+def _raise_if_foreground_window_closed_error(error: Exception, *, headless: bool) -> None:
+    if headless:
+        return
+    message = str(error).lower()
+    if any(fragment in message for fragment in (
+        "target page, context or browser has been closed",
+        "page closed",
+        "browser has been closed",
+        "context closed",
+    )):
+        raise ForegroundWindowClosedError(FOREGROUND_WINDOW_CLOSED_MARKER) from error
+
+
+async def wait_for_baijiahao_publish_result(
+    page: Page,
+    *,
+    headless: bool,
+    normal_timeout_seconds: float = 30,
+    human_timeout_seconds: float | None = None,
+    poll_interval_ms: int = 1000,
+) -> None:
+    """等待发布结果；前台遇到验证码时保留窗口供用户处理。"""
+    start = time.monotonic()
+    human_verification_started_at = None
+
+    try:
+        while True:
+            _raise_if_foreground_window_closed(page, headless=headless)
+
+            url = page.url
+            if BAIJIAHAO_SUCCESS_URL_PREFIX in url or "/rc/content" in url or "/rc/home" in url:
+                baijiahao_logger.success(_msg("🥳", "视频发布成功"))
+                return
+
+            captcha_visible = bool(await page.locator('text="百度安全验证"').count())
+            if captcha_visible:
+                if headless:
+                    raise HumanVerificationRequiredError(
+                        f"{HUMAN_VERIFICATION_REQUIRED_MARKER}: 百家号出现安全验证，请切换前台运行"
+                    )
+                if human_verification_started_at is None:
+                    human_verification_started_at = time.monotonic()
+                    baijiahao_logger.warning(
+                        _msg("🧍", "检测到百度安全验证，请在当前浏览器完成验证；窗口会保持打开")
+                    )
+                elif (
+                    human_timeout_seconds is not None
+                    and time.monotonic() - human_verification_started_at >= human_timeout_seconds
+                ):
+                    raise HumanVerificationRequiredError(
+                        f"{HUMAN_VERIFICATION_REQUIRED_MARKER}: 等待百度安全验证超时"
+                    )
+            elif human_verification_started_at is None and time.monotonic() - start >= normal_timeout_seconds:
+                raise RuntimeError(f"发布后未跳转到成功页面（{normal_timeout_seconds:g}s），当前 URL: {page.url}")
+            elif (
+                human_verification_started_at is not None
+                and human_timeout_seconds is not None
+                and time.monotonic() - human_verification_started_at >= human_timeout_seconds
+            ):
+                raise HumanVerificationRequiredError(
+                    f"{HUMAN_VERIFICATION_REQUIRED_MARKER}: 人工验证完成后仍未确认发布结果"
+                )
+
+            error_toast = page.locator('.cheetah-message-error, .cheetah-message-warning').first
+            if await error_toast.count() and await error_toast.is_visible():
+                err_text = await error_toast.inner_text()
+                baijiahao_logger.warning(_msg("⚠️", f"发布提示: {err_text}"))
+            await page.wait_for_timeout(poll_interval_ms)
+    except Exception as error:
+        _raise_if_foreground_window_closed_error(error, headless=headless)
+        raise
 
 
 def _resolve_account_file(account_file: str | Path) -> str:
@@ -568,29 +657,7 @@ class BaiJiaHaoVideo(BaseVideoUploader):
         await publish_btn.click(force=True)
         baijiahao_logger.info(_msg("🏃", "已点击发布按钮"))
 
-        # 等待跳转或成功提示（最多30s）
-        start = time.monotonic()
-        while time.monotonic() - start < 30:
-            url = page.url
-            # 发布成功跳转
-            if BAIJIAHAO_SUCCESS_URL_PREFIX in url or "/rc/content" in url or "/rc/home" in url:
-                baijiahao_logger.success(_msg("🥳", "视频发布成功"))
-                return
-            # 检查是否出现百度安全验证
-            if await page.locator('text="百度安全验证"').count():
-                raise RuntimeError("出现百度安全验证，需人工处理")
-            # 检查是否有错误提示阻止发布
-            error_toast = page.locator('.cheetah-message-error, .cheetah-message-warning').first
-            if await error_toast.count() and await error_toast.is_visible():
-                err_text = await error_toast.inner_text()
-                baijiahao_logger.warning(_msg("⚠️", f"发布提示: {err_text}"))
-            await page.wait_for_timeout(1000)
-
-        # 超时后再检查一次
-        if BAIJIAHAO_SUCCESS_URL_PREFIX in page.url or "/rc/content" in page.url:
-            baijiahao_logger.success(_msg("🥳", "视频发布成功"))
-        else:
-            raise RuntimeError(f"发布后未跳转到成功页面（30s），当前 URL: {page.url}")
+        await wait_for_baijiahao_publish_result(page, headless=self.headless)
 
     async def main(self):
         async with async_playwright() as playwright:
